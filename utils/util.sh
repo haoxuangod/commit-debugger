@@ -358,6 +358,15 @@ scheduler_mark_build_timeout() {
     "BUILD_FAILURE_REASON=$reason"
 }
 
+scheduler_mark_build_interrupted() {
+  local commit="$1"
+  local reason="$2"
+
+  scheduler_set_status_fields "$commit" \
+    "BUILD_STATE=interrupted" \
+    "BUILD_FAILURE_REASON=$reason"
+}
+
 scheduler_mark_build_attempt_start() {
   local commit="$1"
   local build_type="$2"

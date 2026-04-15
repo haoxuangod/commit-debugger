@@ -134,9 +134,20 @@ author_time="$(git -C "$base_dir" show -s --format=%ai HEAD)"
 commit_time="$(git -C "$base_dir" show -s --format=%ci HEAD)"
 final_status="$(scheduler_get_status_field "$current_commit" FINAL_STATUS || true)"
 
-if [[ "$final_status" == "good" || "$final_status" == "bad" ]]; then
-  :
-fi
+case "$final_status" in
+  good)
+    echo "[state] commit already finalized as GOOD, skip rerun"
+    exit 0
+    ;;
+  bad|artifact_failed|test_failed|timeout)
+    echo "[state] commit already finalized as BAD-like status ($final_status), skip rerun"
+    exit 1
+    ;;
+  skip)
+    echo "[state] commit already finalized as SKIP, skip rerun"
+    exit 125
+    ;;
+esac
 
 echo "========================================"
 echo "Scheduler run #: $total_count"
@@ -348,6 +359,7 @@ else
     fi
 
     start_new_build="true"
+    continuing_previous_build="false"
     BUILD_FALLBACK_REASON="none"
     if [[ "$previous_build_state" == "not_started" || "$always_clean_build" == "true" ]]; then
       build_type="clean"
@@ -359,8 +371,10 @@ else
       fi
 
       if [[ "$previous_build_state" == "building" ]]; then
-        start_new_build="false"
         build_type="incremental"
+        start_new_build="false"
+        continuing_previous_build="true"
+        BUILD_FALLBACK_REASON="resume_from_building_state"
       fi
 
       if [[ "$previous_build_state" == "failed" && "$previous_build_type" == "incremental" ]]; then
@@ -377,15 +391,23 @@ else
       fi
 
       if [[ "$previous_build_state" == "timeout" || "$previous_build_state" == "interrupted" ]]; then
-        start_new_build="false"
         build_type="incremental"
-        BUILD_FALLBACK_REASON="${previous_build_type}_build_${previous_build_state}"
+        if [[ "$previous_build_failure_reason" == *_continued ]]; then
+          start_new_build="true"
+          continuing_previous_build="false"
+          BUILD_FALLBACK_REASON="${previous_build_type}_build_${previous_build_state}_retry_new_attempt"
+        else
+          start_new_build="false"
+          continuing_previous_build="true"
+          BUILD_FALLBACK_REASON="${previous_build_type}_build_${previous_build_state}_continue_previous_attempt"
+        fi
       fi
     fi
   
     echo "BUILD_FALLBACK_REASON: $BUILD_FALLBACK_REASON"
+    echo "START_NEW_BUILD: $start_new_build"
     final_attempt="$build_type"
-    scheduler_mark_build_attempt_start "$current_commit" "$build_type" $start_new_build
+    scheduler_mark_build_attempt_start "$current_commit" "$build_type" "$start_new_build"
     scheduler_mark_building "$current_commit" "$build_type"
     
     run_build_once "$build_type"
@@ -420,11 +442,20 @@ else
       break
     fi
 
-    #缺interrupted
     if [[ "$build_status" -eq 124 ]]; then
       failure_reason="${build_type}_build_timeout"
+      if [[ "$continuing_previous_build" == "true" ]]; then
+        failure_reason="${failure_reason}_continued"
+      fi
       echo $failure_reason
       scheduler_mark_build_timeout "$current_commit" $failure_reason
+    elif [[ "$build_status" -eq 130 || "$build_status" -eq 143 ]]; then
+      failure_reason="${build_type}_build_interrupted"
+      if [[ "$continuing_previous_build" == "true" ]]; then
+        failure_reason="${failure_reason}_continued"
+      fi
+      echo $failure_reason
+      scheduler_mark_build_interrupted "$current_commit" $failure_reason
     elif [[ "$build_status" -ne 0 ]]; then
       failure_reason="${build_type}_build_failed"
       echo $failure_reason
@@ -517,6 +548,18 @@ if [[ "$artifact_check_status" -eq 0 && "$verify_status" -eq 0 ]]; then
 fi
 
 if [[ "$artifact_check_status" -ne 0 ]]; then
+  artifact_state="$(scheduler_get_status_field "$current_commit" ARTIFACT_STATE || true)"
+  if [[ "$artifact_state" != "failed" ]]; then
+    artifact_failure_reason="$(scheduler_get_status_field "$current_commit" ARTIFACT_FAILURE_REASON || true)"
+    if [[ -z "$artifact_failure_reason" || "$artifact_failure_reason" == "none" ]]; then
+      if [[ "$artifact_check_status" -eq 125 ]]; then
+        artifact_failure_reason="artifact_check_error"
+      else
+        artifact_failure_reason="artifact_invalid"
+      fi
+    fi
+    scheduler_mark_artifact_failed "$current_commit" "$artifact_failure_reason"
+  fi
   echo "Result: BAD (artifact unavailable or invalid)"
   echo "Last 50 lines of log:"
   tail -n 50 "$log_file"
@@ -528,6 +571,7 @@ if [[ "$artifact_check_status" -ne 0 ]]; then
   exit 1
 fi
 
+scheduler_mark_test_failed "$current_commit"
 echo "Result: BAD (verify failed)"
 echo "Last 50 lines of log:"
 tail -n 50 "$log_file"
