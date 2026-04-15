@@ -87,6 +87,20 @@ trap 'finalize_exit' EXIT
 # shellcheck disable=SC1090
 source "$util_script"
 
+STATE_FINAL_GOOD="good"
+STATE_FINAL_SKIP="skip"
+STATE_BUILD_NOT_STARTED="not_started"
+STATE_BUILD_BUILDING="building"
+STATE_BUILD_FAILED="failed"
+STATE_BUILD_SUCCEEDED="succeeded"
+STATE_BUILD_TIMEOUT="timeout"
+STATE_BUILD_INTERRUPTED="interrupted"
+STATE_BUILD_TYPE_INCREMENTAL="incremental"
+STATE_BUILD_TYPE_CLEAN="clean"
+STATE_ARTIFACT_CHECK_ERROR="artifact_check_error"
+STATE_ARTIFACT_INVALID="artifact_invalid"
+STATE_REASON_BUILD_REACH_MAX_TRIES="build_reach_max_tries"
+
 current_commit="$(git -C "$base_dir" rev-parse HEAD 2>/dev/null)" || exit 125
 current_commit_short="$(git -C "$base_dir" rev-parse --short HEAD 2>/dev/null)" || exit 125
 export SCHEDULER_CURRENT_COMMIT="$current_commit"
@@ -135,7 +149,7 @@ commit_time="$(git -C "$base_dir" show -s --format=%ci HEAD)"
 final_status="$(scheduler_get_status_field "$current_commit" FINAL_STATUS || true)"
 
 case "$final_status" in
-  good)
+  "$STATE_FINAL_GOOD")
     echo "[state] commit already finalized as GOOD, skip rerun"
     exit 0
     ;;
@@ -143,7 +157,7 @@ case "$final_status" in
     echo "[state] commit already finalized as BAD-like status ($final_status), skip rerun"
     exit 1
     ;;
-  skip)
+  "$STATE_FINAL_SKIP")
     echo "[state] commit already finalized as SKIP, skip rerun"
     exit 125
     ;;
@@ -318,6 +332,34 @@ run_build_once() {
   return "$build_status"
 }
 
+STATE_PREV_BUILD_STATE="$STATE_BUILD_NOT_STARTED"
+STATE_PREV_BUILD_FAILURE_REASON="none"
+STATE_PREV_ARTIFACT_FAILURE_REASON="none"
+STATE_PREV_BUILD_ATTEMPT_COUNT=0
+STATE_PREV_BUILD_TYPE="$STATE_BUILD_TYPE_INCREMENTAL"
+
+load_build_state_snapshot() {
+  local commit="$1"
+  local raw_attempt_count
+
+  STATE_PREV_BUILD_STATE="$(scheduler_get_status_field "$commit" BUILD_STATE || true)"
+  STATE_PREV_BUILD_FAILURE_REASON="$(scheduler_get_status_field "$commit" BUILD_FAILURE_REASON || true)"
+  STATE_PREV_ARTIFACT_FAILURE_REASON="$(scheduler_get_status_field "$commit" ARTIFACT_FAILURE_REASON || true)"
+  raw_attempt_count="$(scheduler_get_status_field "$commit" BUILD_ATTEMPT_COUNT || true)"
+  STATE_PREV_BUILD_TYPE="$(scheduler_get_status_field "$commit" BUILD_TYPE || true)"
+
+  [[ -z "$STATE_PREV_BUILD_STATE" ]] && STATE_PREV_BUILD_STATE="$STATE_BUILD_NOT_STARTED"
+  [[ -z "$STATE_PREV_BUILD_FAILURE_REASON" ]] && STATE_PREV_BUILD_FAILURE_REASON="none"
+  [[ -z "$STATE_PREV_ARTIFACT_FAILURE_REASON" ]] && STATE_PREV_ARTIFACT_FAILURE_REASON="none"
+  [[ -z "$STATE_PREV_BUILD_TYPE" ]] && STATE_PREV_BUILD_TYPE="$STATE_BUILD_TYPE_INCREMENTAL"
+
+  if [[ "$raw_attempt_count" =~ ^[0-9]+$ ]]; then
+    STATE_PREV_BUILD_ATTEMPT_COUNT="$raw_attempt_count"
+  else
+    STATE_PREV_BUILD_ATTEMPT_COUNT=0
+  fi
+}
+
 # 统一管理构建重试策略，避免主流程里出现过多嵌套 if。
 # 输出格式（按行）：
 #   1) build_type               => incremental | clean
@@ -328,14 +370,10 @@ run_build_once() {
 determine_build_plan() {
   local max_try="$1"
   local build_dir_path="$2"
-  local previous_build_state="$3"
-  local previous_build_type="$4"
-  local previous_build_failure_reason="$5"
-  local previous_artifact_failure_reason="$6"
-  local build_attempt_count="$7"
-  local always_clean_build="$8"
+  local build_attempt_count="$3"
+  local always_clean_build="$4"
 
-  local build_type="incremental"
+  local build_type="$STATE_BUILD_TYPE_INCREMENTAL"
   local start_new_build="true"
   local continuing_previous_build="false"
   local fallback_reason="none"
@@ -343,16 +381,16 @@ determine_build_plan() {
   local need_clean_build=0
 
   if (( build_attempt_count >= max_try )); then
-    echo "incremental"
+    echo "$STATE_BUILD_TYPE_INCREMENTAL"
     echo "true"
     echo "false"
-    echo "build_reach_max_tries"
+    echo "$STATE_REASON_BUILD_REACH_MAX_TRIES"
     echo "true"
     return 0
   fi
 
-  if [[ "$previous_build_state" == "not_started" || "$always_clean_build" == "true" ]]; then
-    build_type="clean"
+  if [[ "$STATE_PREV_BUILD_STATE" == "$STATE_BUILD_NOT_STARTED" || "$always_clean_build" == "true" ]]; then
+    build_type="$STATE_BUILD_TYPE_CLEAN"
     echo "$build_type"
     echo "$start_new_build"
     echo "$continuing_previous_build"
@@ -367,38 +405,38 @@ determine_build_plan() {
   fi
 
   # 处于 building 状态时，默认继续同一次构建（不新增 attempt）。
-  if [[ "$previous_build_state" == "building" ]]; then
+  if [[ "$STATE_PREV_BUILD_STATE" == "$STATE_BUILD_BUILDING" ]]; then
     start_new_build="false"
     continuing_previous_build="true"
     fallback_reason="resume_from_building_state"
   fi
 
   # 增量构建失败后，下一轮降级为 clean。
-  if [[ "$previous_build_state" == "failed" && "$previous_build_type" == "incremental" ]]; then
-    build_type="clean"
+  if [[ "$STATE_PREV_BUILD_STATE" == "$STATE_BUILD_FAILED" && "$STATE_PREV_BUILD_TYPE" == "$STATE_BUILD_TYPE_INCREMENTAL" ]]; then
+    build_type="$STATE_BUILD_TYPE_CLEAN"
     fallback_reason="incremental_build_failed"
   # 构建成功但产物校验失败，也强制 clean。
-  elif [[ "$previous_build_state" == "succeeded" ]] &&
-       [[ "$previous_artifact_failure_reason" == "artifact_check_error" ||
-          "$previous_artifact_failure_reason" == "artifact_invalid" ]]; then
-    build_type="clean"
-    fallback_reason="${previous_artifact_failure_reason}"
+  elif [[ "$STATE_PREV_BUILD_STATE" == "$STATE_BUILD_SUCCEEDED" ]] &&
+       [[ "$STATE_PREV_ARTIFACT_FAILURE_REASON" == "$STATE_ARTIFACT_CHECK_ERROR" ||
+          "$STATE_PREV_ARTIFACT_FAILURE_REASON" == "$STATE_ARTIFACT_INVALID" ]]; then
+    build_type="$STATE_BUILD_TYPE_CLEAN"
+    fallback_reason="${STATE_PREV_ARTIFACT_FAILURE_REASON}"
   elif [[ "$need_clean_build" -eq 1 ]]; then
-    build_type="clean"
+    build_type="$STATE_BUILD_TYPE_CLEAN"
     fallback_reason="build_dir_is_empty_or_not_exist"
   fi
 
   # timeout/interrupted 时优先“续跑”，已经续跑过一次则开新 attempt。
-  if [[ "$previous_build_state" == "timeout" || "$previous_build_state" == "interrupted" ]]; then
-    build_type="incremental"
-    if [[ "$previous_build_failure_reason" == *_continued ]]; then
+  if [[ "$STATE_PREV_BUILD_STATE" == "$STATE_BUILD_TIMEOUT" || "$STATE_PREV_BUILD_STATE" == "$STATE_BUILD_INTERRUPTED" ]]; then
+    build_type="$STATE_BUILD_TYPE_INCREMENTAL"
+    if [[ "$STATE_PREV_BUILD_FAILURE_REASON" == *_continued ]]; then
       start_new_build="true"
       continuing_previous_build="false"
-      fallback_reason="${previous_build_type}_build_${previous_build_state}_retry_new_attempt"
+      fallback_reason="${STATE_PREV_BUILD_TYPE}_build_${STATE_PREV_BUILD_STATE}_retry_new_attempt"
     else
       start_new_build="false"
       continuing_previous_build="true"
-      fallback_reason="${previous_build_type}_build_${previous_build_state}_continue_previous_attempt"
+      fallback_reason="${STATE_PREV_BUILD_TYPE}_build_${STATE_PREV_BUILD_STATE}_continue_previous_attempt"
     fi
   fi
 
@@ -491,20 +529,13 @@ else
   always_clean_build="false"
   # 构建循环：读取上一次状态 -> 决策本次策略 -> 执行构建 -> 按结果落盘。
   while true; do
-    previous_build_state="$(scheduler_get_status_field "$current_commit" BUILD_STATE || true)"
-    previous_build_failure_reason="$(scheduler_get_status_field "$current_commit" BUILD_FAILURE_REASON || true)"
-    previous_artifact_failure_reason="$(scheduler_get_status_field "$current_commit" ARTIFACT_FAILURE_REASON || true)"
-    build_attempt_count="$(scheduler_get_status_field "$current_commit" BUILD_ATTEMPT_COUNT || true)"
-    previous_build_type="$(scheduler_get_status_field "$current_commit" BUILD_TYPE || "incremental")"
+    load_build_state_snapshot "$current_commit"
+    build_attempt_count="$STATE_PREV_BUILD_ATTEMPT_COUNT"
 
     mapfile -t plan < <(
       determine_build_plan \
         "$max_try_times" \
         "$build_dir" \
-        "$previous_build_state" \
-        "$previous_build_type" \
-        "$previous_build_failure_reason" \
-        "$previous_artifact_failure_reason" \
         "$build_attempt_count" \
         "$always_clean_build"
     )
@@ -516,7 +547,7 @@ else
 
     if [[ "$stop_build_loop" == "true" ]]; then
       echo "reach max tries:$build_attempt_count>=$max_try_times"
-      scheduler_mark_build_final_failed "$current_commit" "build_reach_max_tries"
+      scheduler_mark_build_final_failed "$current_commit" "$STATE_REASON_BUILD_REACH_MAX_TRIES"
       build_status=111
       break
     fi
