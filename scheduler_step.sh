@@ -91,6 +91,7 @@ STATE_FINAL_GOOD="good"
 STATE_FINAL_SKIP="skip"
 STATE_BUILD_NOT_STARTED="not_started"
 STATE_BUILD_BUILDING="building"
+STATE_BUILD_RECOVERING="recovering"
 STATE_BUILD_FAILED="failed"
 STATE_BUILD_SUCCEEDED="succeeded"
 STATE_BUILD_TIMEOUT="timeout"
@@ -100,6 +101,7 @@ STATE_BUILD_TYPE_CLEAN="clean"
 STATE_ARTIFACT_CHECK_ERROR="artifact_check_error"
 STATE_ARTIFACT_INVALID="artifact_invalid"
 STATE_REASON_BUILD_REACH_MAX_TRIES="build_reach_max_tries"
+STATE_REASON_STALE_BUILDING_STATE="stale_building_state"
 
 current_commit="$(git -C "$base_dir" rev-parse HEAD 2>/dev/null)" || exit 125
 current_commit_short="$(git -C "$base_dir" rev-parse --short HEAD 2>/dev/null)" || exit 125
@@ -404,41 +406,52 @@ determine_build_plan() {
     need_clean_build=1
   fi
 
-  # 处于 building 状态时，默认继续同一次构建（不新增 attempt）。
-  if [[ "$STATE_PREV_BUILD_STATE" == "$STATE_BUILD_BUILDING" ]]; then
-    start_new_build="false"
-    continuing_previous_build="true"
-    fallback_reason="resume_from_building_state"
-  fi
-
-  # 增量构建失败后，下一轮降级为 clean。
-  if [[ "$STATE_PREV_BUILD_STATE" == "$STATE_BUILD_FAILED" && "$STATE_PREV_BUILD_TYPE" == "$STATE_BUILD_TYPE_INCREMENTAL" ]]; then
-    build_type="$STATE_BUILD_TYPE_CLEAN"
-    fallback_reason="incremental_build_failed"
-  # 构建成功但产物校验失败，也强制 clean。
-  elif [[ "$STATE_PREV_BUILD_STATE" == "$STATE_BUILD_SUCCEEDED" ]] &&
-       [[ "$STATE_PREV_ARTIFACT_FAILURE_REASON" == "$STATE_ARTIFACT_CHECK_ERROR" ||
-          "$STATE_PREV_ARTIFACT_FAILURE_REASON" == "$STATE_ARTIFACT_INVALID" ]]; then
-    build_type="$STATE_BUILD_TYPE_CLEAN"
-    fallback_reason="${STATE_PREV_ARTIFACT_FAILURE_REASON}"
-  elif [[ "$need_clean_build" -eq 1 ]]; then
-    build_type="$STATE_BUILD_TYPE_CLEAN"
-    fallback_reason="build_dir_is_empty_or_not_exist"
-  fi
-
-  # timeout/interrupted 时优先“续跑”，已经续跑过一次则开新 attempt。
-  if [[ "$STATE_PREV_BUILD_STATE" == "$STATE_BUILD_TIMEOUT" || "$STATE_PREV_BUILD_STATE" == "$STATE_BUILD_INTERRUPTED" ]]; then
-    build_type="$STATE_BUILD_TYPE_INCREMENTAL"
-    if [[ "$STATE_PREV_BUILD_FAILURE_REASON" == *_continued ]]; then
+  # 用统一状态机处理真实场景下的恢复逻辑。
+  # 注意：building 状态常见于上次任务被中断，此时无法“接着跑同一 pid”，
+  # 因而应恢复为新的构建 attempt，而不是无穷续跑。
+  case "$STATE_PREV_BUILD_STATE" in
+    "$STATE_BUILD_BUILDING")
       start_new_build="true"
       continuing_previous_build="false"
-      fallback_reason="${STATE_PREV_BUILD_TYPE}_build_${STATE_PREV_BUILD_STATE}_retry_new_attempt"
-    else
-      start_new_build="false"
-      continuing_previous_build="true"
-      fallback_reason="${STATE_PREV_BUILD_TYPE}_build_${STATE_PREV_BUILD_STATE}_continue_previous_attempt"
-    fi
-  fi
+      fallback_reason="$STATE_REASON_STALE_BUILDING_STATE"
+      if [[ "$need_clean_build" -eq 1 ]]; then
+        build_type="$STATE_BUILD_TYPE_CLEAN"
+      else
+        build_type="$STATE_BUILD_TYPE_INCREMENTAL"
+      fi
+      ;;
+    "$STATE_BUILD_FAILED")
+      if [[ "$STATE_PREV_BUILD_TYPE" == "$STATE_BUILD_TYPE_INCREMENTAL" ]]; then
+        build_type="$STATE_BUILD_TYPE_CLEAN"
+        fallback_reason="incremental_build_failed"
+      fi
+      ;;
+    "$STATE_BUILD_SUCCEEDED")
+      if [[ "$STATE_PREV_ARTIFACT_FAILURE_REASON" == "$STATE_ARTIFACT_CHECK_ERROR" ||
+            "$STATE_PREV_ARTIFACT_FAILURE_REASON" == "$STATE_ARTIFACT_INVALID" ]]; then
+        build_type="$STATE_BUILD_TYPE_CLEAN"
+        fallback_reason="${STATE_PREV_ARTIFACT_FAILURE_REASON}"
+      fi
+      ;;
+    "$STATE_BUILD_TIMEOUT"|"$STATE_BUILD_INTERRUPTED")
+      build_type="$STATE_BUILD_TYPE_INCREMENTAL"
+      if [[ "$STATE_PREV_BUILD_FAILURE_REASON" == *_continued ]]; then
+        start_new_build="true"
+        continuing_previous_build="false"
+        fallback_reason="${STATE_PREV_BUILD_TYPE}_build_${STATE_PREV_BUILD_STATE}_retry_new_attempt"
+      else
+        start_new_build="false"
+        continuing_previous_build="true"
+        fallback_reason="${STATE_PREV_BUILD_TYPE}_build_${STATE_PREV_BUILD_STATE}_continue_previous_attempt"
+      fi
+      ;;
+    *)
+      if [[ "$need_clean_build" -eq 1 ]]; then
+        build_type="$STATE_BUILD_TYPE_CLEAN"
+        fallback_reason="build_dir_is_empty_or_not_exist"
+      fi
+      ;;
+  esac
 
   echo "$build_type"
   echo "$start_new_build"
@@ -503,6 +516,18 @@ handle_build_outcome() {
   return 1
 }
 
+mark_recovered_building_state_if_needed() {
+  local commit="$1"
+  if [[ "$STATE_PREV_BUILD_STATE" != "$STATE_BUILD_BUILDING" ]]; then
+    return 0
+  fi
+
+  echo "[state] found stale BUILD_STATE=building from previous run, mark as recovering"
+  scheduler_set_status_fields "$commit" \
+    "BUILD_STATE=$STATE_BUILD_RECOVERING" \
+    "BUILD_FAILURE_REASON=$STATE_REASON_STALE_BUILDING_STATE"
+}
+
 artifact_check_status=1
 build_status=0
 verify_status=125
@@ -530,6 +555,7 @@ else
   # 构建循环：读取上一次状态 -> 决策本次策略 -> 执行构建 -> 按结果落盘。
   while true; do
     load_build_state_snapshot "$current_commit"
+    mark_recovered_building_state_if_needed "$current_commit"
     build_attempt_count="$STATE_PREV_BUILD_ATTEMPT_COUNT"
 
     mapfile -t plan < <(
