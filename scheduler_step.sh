@@ -318,6 +318,153 @@ run_build_once() {
   return "$build_status"
 }
 
+# 统一管理构建重试策略，避免主流程里出现过多嵌套 if。
+# 输出格式（按行）：
+#   1) build_type               => incremental | clean
+#   2) start_new_build          => true | false
+#   3) continuing_previous      => true | false
+#   4) fallback_reason          => 文本原因
+#   5) stop_build_loop          => true | false（是否达到最大重试次数）
+determine_build_plan() {
+  local max_try="$1"
+  local build_dir_path="$2"
+  local previous_build_state="$3"
+  local previous_build_type="$4"
+  local previous_build_failure_reason="$5"
+  local previous_artifact_failure_reason="$6"
+  local build_attempt_count="$7"
+  local always_clean_build="$8"
+
+  local build_type="incremental"
+  local start_new_build="true"
+  local continuing_previous_build="false"
+  local fallback_reason="none"
+  local stop_build_loop="false"
+  local need_clean_build=0
+
+  if (( build_attempt_count >= max_try )); then
+    echo "incremental"
+    echo "true"
+    echo "false"
+    echo "build_reach_max_tries"
+    echo "true"
+    return 0
+  fi
+
+  if [[ "$previous_build_state" == "not_started" || "$always_clean_build" == "true" ]]; then
+    build_type="clean"
+    echo "$build_type"
+    echo "$start_new_build"
+    echo "$continuing_previous_build"
+    echo "$fallback_reason"
+    echo "$stop_build_loop"
+    return 0
+  fi
+
+  # build_dir 不存在/为空，或者第一次构建，必须 clean build。
+  if [[ ! -d "$build_dir_path" ]] || [[ -z "$(ls -A "$build_dir_path" 2>/dev/null)" || ((build_attempt_count == 0)) ]]; then
+    need_clean_build=1
+  fi
+
+  # 处于 building 状态时，默认继续同一次构建（不新增 attempt）。
+  if [[ "$previous_build_state" == "building" ]]; then
+    start_new_build="false"
+    continuing_previous_build="true"
+    fallback_reason="resume_from_building_state"
+  fi
+
+  # 增量构建失败后，下一轮降级为 clean。
+  if [[ "$previous_build_state" == "failed" && "$previous_build_type" == "incremental" ]]; then
+    build_type="clean"
+    fallback_reason="incremental_build_failed"
+  # 构建成功但产物校验失败，也强制 clean。
+  elif [[ "$previous_build_state" == "succeeded" ]] &&
+       [[ "$previous_artifact_failure_reason" == "artifact_check_error" ||
+          "$previous_artifact_failure_reason" == "artifact_invalid" ]]; then
+    build_type="clean"
+    fallback_reason="${previous_artifact_failure_reason}"
+  elif [[ "$need_clean_build" -eq 1 ]]; then
+    build_type="clean"
+    fallback_reason="build_dir_is_empty_or_not_exist"
+  fi
+
+  # timeout/interrupted 时优先“续跑”，已经续跑过一次则开新 attempt。
+  if [[ "$previous_build_state" == "timeout" || "$previous_build_state" == "interrupted" ]]; then
+    build_type="incremental"
+    if [[ "$previous_build_failure_reason" == *_continued ]]; then
+      start_new_build="true"
+      continuing_previous_build="false"
+      fallback_reason="${previous_build_type}_build_${previous_build_state}_retry_new_attempt"
+    else
+      start_new_build="false"
+      continuing_previous_build="true"
+      fallback_reason="${previous_build_type}_build_${previous_build_state}_continue_previous_attempt"
+    fi
+  fi
+
+  echo "$build_type"
+  echo "$start_new_build"
+  echo "$continuing_previous_build"
+  echo "$fallback_reason"
+  echo "$stop_build_loop"
+}
+
+# 处理一次构建后的状态落盘。
+# 返回值语义：
+#   0 => 可结束当前 commit 的构建流程（成功或 clean 失败已定论）
+#   1 => 需要继续下一轮重试
+handle_build_outcome() {
+  local commit="$1"
+  local build_type="$2"
+  local continuing_previous_build="$3"
+  local build_status="$4"
+  local artifact_check_status="$5"
+
+  local failure_reason
+
+  if [[ "$build_status" -eq 0 ]]; then
+    scheduler_mark_build_succeeded "$commit"
+    if [[ "$artifact_check_status" -eq 0 ]]; then
+      scheduler_mark_artifact_ready "$commit" "$artifact_dir" "build"
+      return 0
+    fi
+
+    if [[ "$artifact_check_status" -eq 125 ]]; then
+      if [[ "$build_type" == "clean" ]]; then
+        scheduler_mark_artifact_failed "$commit" "artifact_check_error"
+        return 0
+      fi
+      scheduler_mark_artifact_failure_reason "$commit" "artifact_check_error"
+      return 1
+    fi
+
+    if [[ "$build_type" == "clean" ]]; then
+      scheduler_mark_artifact_failed "$commit" "artifact_invalid"
+      return 0
+    fi
+    scheduler_mark_artifact_failure_reason "$commit" "artifact_invalid"
+    return 1
+  fi
+
+  if [[ "$build_status" -eq 124 ]]; then
+    failure_reason="${build_type}_build_timeout"
+    [[ "$continuing_previous_build" == "true" ]] && failure_reason="${failure_reason}_continued"
+    echo "$failure_reason"
+    scheduler_mark_build_timeout "$commit" "$failure_reason"
+  elif [[ "$build_status" -eq 130 || "$build_status" -eq 143 ]]; then
+    failure_reason="${build_type}_build_interrupted"
+    [[ "$continuing_previous_build" == "true" ]] && failure_reason="${failure_reason}_continued"
+    echo "$failure_reason"
+    scheduler_mark_build_interrupted "$commit" "$failure_reason"
+  else
+    failure_reason="${build_type}_build_failed"
+    echo "$failure_reason"
+    scheduler_mark_build_failed "$commit" "$failure_reason"
+  fi
+
+  return 1
+}
+
 artifact_check_status=1
 build_status=0
 verify_status=125
@@ -342,68 +489,38 @@ else
 
   final_attempt="none"
   always_clean_build="false"
+  # 构建循环：读取上一次状态 -> 决策本次策略 -> 执行构建 -> 按结果落盘。
   while true; do
     previous_build_state="$(scheduler_get_status_field "$current_commit" BUILD_STATE || true)"
     previous_build_failure_reason="$(scheduler_get_status_field "$current_commit" BUILD_FAILURE_REASON || true)"
     previous_artifact_failure_reason="$(scheduler_get_status_field "$current_commit" ARTIFACT_FAILURE_REASON || true)"
     build_attempt_count="$(scheduler_get_status_field "$current_commit" BUILD_ATTEMPT_COUNT || true)"
     previous_build_type="$(scheduler_get_status_field "$current_commit" BUILD_TYPE || "incremental")"
-    build_type="incremental"
-    if (( build_attempt_count < max_try_times )); then
-      echo "build_attempt_count:$build_attempt_count (can try)"
-    else
+
+    mapfile -t plan < <(
+      determine_build_plan \
+        "$max_try_times" \
+        "$build_dir" \
+        "$previous_build_state" \
+        "$previous_build_type" \
+        "$previous_build_failure_reason" \
+        "$previous_artifact_failure_reason" \
+        "$build_attempt_count" \
+        "$always_clean_build"
+    )
+    build_type="${plan[0]}"
+    start_new_build="${plan[1]}"
+    continuing_previous_build="${plan[2]}"
+    BUILD_FALLBACK_REASON="${plan[3]}"
+    stop_build_loop="${plan[4]}"
+
+    if [[ "$stop_build_loop" == "true" ]]; then
       echo "reach max tries:$build_attempt_count>=$max_try_times"
       scheduler_mark_build_final_failed "$current_commit" "build_reach_max_tries"
       build_status=111
       break
     fi
-
-    start_new_build="true"
-    continuing_previous_build="false"
-    BUILD_FALLBACK_REASON="none"
-    if [[ "$previous_build_state" == "not_started" || "$always_clean_build" == "true" ]]; then
-      build_type="clean"
-    else
-      # build_dir 不存在或者为空目录 或者是第一次build-> 必须 clean
-      need_clean_build=0
-      if [[ ! -d "$build_dir" ]] || [[ -z "$(ls -A "$build_dir" 2>/dev/null)" || ((build_attempt_count == 0)) ]]; then
-        need_clean_build=1
-      fi
-
-      if [[ "$previous_build_state" == "building" ]]; then
-        build_type="incremental"
-        start_new_build="false"
-        continuing_previous_build="true"
-        BUILD_FALLBACK_REASON="resume_from_building_state"
-      fi
-
-      if [[ "$previous_build_state" == "failed" && "$previous_build_type" == "incremental" ]]; then
-        build_type="clean"
-        BUILD_FALLBACK_REASON="incremental_build_failed"
-      elif [[ "$previous_build_state" == "succeeded" ]] &&
-           [[ "$previous_artifact_failure_reason" == "artifact_check_error" ||
-              "$previous_artifact_failure_reason" == "artifact_invalid" ]]; then
-          build_type="clean"
-          BUILD_FALLBACK_REASON="${previous_artifact_failure_reason}"
-      elif [[ "$need_clean_build" -eq 1 ]]; then
-        build_type="clean"
-        BUILD_FALLBACK_REASON="build_dir_is_empty_or_not_exist"
-      fi
-
-      if [[ "$previous_build_state" == "timeout" || "$previous_build_state" == "interrupted" ]]; then
-        build_type="incremental"
-        if [[ "$previous_build_failure_reason" == *_continued ]]; then
-          start_new_build="true"
-          continuing_previous_build="false"
-          BUILD_FALLBACK_REASON="${previous_build_type}_build_${previous_build_state}_retry_new_attempt"
-        else
-          start_new_build="false"
-          continuing_previous_build="true"
-          BUILD_FALLBACK_REASON="${previous_build_type}_build_${previous_build_state}_continue_previous_attempt"
-        fi
-      fi
-    fi
-  
+    echo "build_attempt_count:$build_attempt_count (can try)"
     echo "BUILD_FALLBACK_REASON: $BUILD_FALLBACK_REASON"
     echo "START_NEW_BUILD: $start_new_build"
     final_attempt="$build_type"
@@ -420,47 +537,15 @@ else
       artifact_check_status=1
     fi
 
-    if [[ "$build_status" -eq 0 ]]; then
-      scheduler_mark_build_succeeded "$current_commit"
-      if [[ "$artifact_check_status" -eq 0 ]]; then
-        scheduler_mark_artifact_ready "$current_commit" "$artifact_dir" "build"
-      elif [[ "$artifact_check_status" -eq 125 ]]; then
-        if [[ "$build_type" == "clean" ]]; then
-          scheduler_mark_artifact_failed "$current_commit" "artifact_check_error"
-        else
-          scheduler_mark_artifact_failure_reason "$current_commit" "artifact_check_error"
-          continue
-        fi
-      else
-        if [[ "$build_type" == "clean" ]]; then
-          scheduler_mark_artifact_failed "$current_commit" "artifact_invalid"
-        else
-          scheduler_mark_artifact_failure_reason "$current_commit" "artifact_invalid"
-          continue
-        fi
-      fi
+    if handle_build_outcome \
+      "$current_commit" \
+      "$build_type" \
+      "$continuing_previous_build" \
+      "$build_status" \
+      "$artifact_check_status"; then
       break
     fi
 
-    if [[ "$build_status" -eq 124 ]]; then
-      failure_reason="${build_type}_build_timeout"
-      if [[ "$continuing_previous_build" == "true" ]]; then
-        failure_reason="${failure_reason}_continued"
-      fi
-      echo $failure_reason
-      scheduler_mark_build_timeout "$current_commit" $failure_reason
-    elif [[ "$build_status" -eq 130 || "$build_status" -eq 143 ]]; then
-      failure_reason="${build_type}_build_interrupted"
-      if [[ "$continuing_previous_build" == "true" ]]; then
-        failure_reason="${failure_reason}_continued"
-      fi
-      echo $failure_reason
-      scheduler_mark_build_interrupted "$current_commit" $failure_reason
-    elif [[ "$build_status" -ne 0 ]]; then
-      failure_reason="${build_type}_build_failed"
-      echo $failure_reason
-      scheduler_mark_build_failed "$current_commit" $failure_reason
-    fi
     #防止未知错误导致一直快速循环，卡死，无法使用ctrl+c结束
     sleep 1
     
