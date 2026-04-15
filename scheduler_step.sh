@@ -14,6 +14,7 @@ util_script="${SCHEDULER_UTIL_SCRIPT:?SCHEDULER_UTIL_SCRIPT is not set}"
 # 2) artifact check 脚本：检查统一 artifact 目录下的产物是否存在且合法
 build_step_script="${SCHEDULER_BUILD_STEP_SCRIPT:?SCHEDULER_BUILD_STEP_SCRIPT is not set}"
 artifact_check_script="${SCHEDULER_ARTIFACT_CHECK_SCRIPT:?SCHEDULER_ARTIFACT_CHECK_SCRIPT is not set}"
+verify_script="${SCHEDULER_VERIFY_SCRIPT:-$script_dir/user_scripts/verify_latest_build.sh}"
 
 mkdir -p "$log_dir"
 
@@ -59,6 +60,11 @@ fi
 
 if [[ ! -f "$artifact_check_script" ]]; then
   echo "Error: artifact check script not found: $artifact_check_script" >&2
+  exit 125
+fi
+
+if [[ ! -f "$verify_script" ]]; then
+  echo "Error: verify script not found: $verify_script" >&2
   exit 125
 fi
 
@@ -144,6 +150,7 @@ echo "Artifact dir: $artifact_dir"
 echo "Build dir: $build_dir"
 echo "Artifact check script: $artifact_check_script"
 echo "Build step script: $build_step_script"
+echo "Verify script: $verify_script"
 echo "========================================"
 
 {
@@ -159,6 +166,7 @@ echo "========================================"
   echo "Build dir: $build_dir"
   echo "Artifact check script: $artifact_check_script"
   echo "Build step script: $build_step_script"
+  echo "Verify script: $verify_script"
   echo "========================================"
 } >> "$summary_log"
 
@@ -301,6 +309,7 @@ run_build_once() {
 
 artifact_check_status=1
 build_status=0
+verify_status=125
 verify_elapsed=-1
 build_elapsed=0
 final_attempt="none"
@@ -428,6 +437,28 @@ else
 
 fi
 
+if [[ "$artifact_check_status" -eq 0 ]]; then
+  verify_start_ts="$(date +%s)"
+  verify_start_human="$(date '+%F %T')"
+  echo "[verify] start: $verify_start_human"
+  echo "[verify] using latest build artifacts under: $build_dir"
+
+  "$verify_script" >>"$log_file" 2>&1
+  verify_status=$?
+
+  verify_end_ts="$(date +%s)"
+  verify_end_human="$(date '+%F %T')"
+  verify_elapsed=$((verify_end_ts - verify_start_ts))
+  echo "[verify] end: $verify_end_human"
+  echo "[verify] elapsed: ${verify_elapsed}s"
+
+  if [[ "$verify_status" -eq 0 ]]; then
+    echo "[verify] success"
+  else
+    echo "[verify] failed"
+  fi
+fi
+
 end_time="$(date +%s)"
 end_human="$(date '+%F %T')"
 elapsed=$((end_time - start_time))
@@ -444,9 +475,13 @@ echo "Current commit: $current_commit_short ($current_commit)"
 echo "Final attempt: $final_attempt"
 echo "End time: $end_human"
 echo "Build elapsed: ${build_elapsed}s"
+echo "Verify elapsed: ${verify_elapsed}s"
 echo "Artifact check exit code: $artifact_check_status"
 if [[ "$did_build" -eq 1 ]]; then
   echo "Build exit code: $build_status"
+fi
+if [[ "$artifact_check_status" -eq 0 ]]; then
+  echo "Verify exit code: $verify_status"
 fi
 echo "Elapsed this run: ${elapsed}s"
 echo "Accumulated elapsed: ${total_elapsed}s"
@@ -455,15 +490,19 @@ echo "Accumulated elapsed: ${total_elapsed}s"
   echo "End time: $end_human"
   echo "Final attempt: $final_attempt"
   echo "Build elapsed: ${build_elapsed}s"
+  echo "Verify elapsed: ${verify_elapsed}s"
   echo "Artifact check exit code: $artifact_check_status"
   if [[ "$did_build" -eq 1 ]]; then
     echo "Build exit code: $build_status"
+  fi
+  if [[ "$artifact_check_status" -eq 0 ]]; then
+    echo "Verify exit code: $verify_status"
   fi
   echo "Elapsed this run: ${elapsed}s"
   echo "Accumulated elapsed: ${total_elapsed}s"
 } >> "$summary_log"
 
-if [[ "$artifact_check_status" -eq 0 ]]; then
+if [[ "$artifact_check_status" -eq 0 && "$verify_status" -eq 0 ]]; then
   scheduler_mark_testing_ready "$current_commit"
   scheduler_mark_good "$current_commit"
 
@@ -477,11 +516,23 @@ if [[ "$artifact_check_status" -eq 0 ]]; then
   exit 0
 fi
 
-echo "Result: BAD (artifact unavailable or invalid)"
+if [[ "$artifact_check_status" -ne 0 ]]; then
+  echo "Result: BAD (artifact unavailable or invalid)"
+  echo "Last 50 lines of log:"
+  tail -n 50 "$log_file"
+  {
+    echo "Result: BAD (artifact unavailable or invalid)"
+    echo "----------------------------------------"
+    echo
+  } >> "$summary_log"
+  exit 1
+fi
+
+echo "Result: BAD (verify failed)"
 echo "Last 50 lines of log:"
 tail -n 50 "$log_file"
 {
-  echo "Result: BAD (artifact unavailable or invalid)"
+  echo "Result: BAD (verify failed)"
   echo "----------------------------------------"
   echo
 } >> "$summary_log"
