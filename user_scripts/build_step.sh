@@ -69,14 +69,36 @@ if [[ "$unity_build" == "true" ]]; then
   patch_unity_off_in_cmakelists "$base_dir/triton/CMakeLists.txt"
 fi
 
-export DISTCC_HOSTS="localhost:13632/72 localhost:33632/72"
+workers=(
+  "worker1:13632"
+  "worker2:33632"
+)
 
-if ! lsof -i :13632 > /dev/null 2>&1; then
-    ssh -fN -L 13632:127.0.0.1:3632 worker1
+active_distcc_hosts=()
+for worker_entry in "${workers[@]}"; do
+  worker="${worker_entry%%:*}"
+  local_port="${worker_entry##*:}"
+
+  if lsof -i :"$local_port" > /dev/null 2>&1; then
+    active_distcc_hosts+=("localhost:${local_port}/72")
+    continue
+  fi
+
+  if ssh -o BatchMode=yes -o ConnectTimeout=3 "$worker" "echo ok" > /dev/null 2>&1; then
+    ssh -fN -L "${local_port}:127.0.0.1:3632" "$worker"
+    active_distcc_hosts+=("localhost:${local_port}/72")
+  fi
+done
+
+enable_distcc_opt=""
+if (( ${#active_distcc_hosts[@]} > 0 )); then
+  DISTCC_HOSTS="${active_distcc_hosts[*]}"
+  export DISTCC_HOSTS
+  enable_distcc_opt="--enable-distcc"
+  echo "DISTCC enabled with hosts: $DISTCC_HOSTS"
+else
+  echo "No reachable distcc workers, build without distcc"
 fi
-
-export DISTCC_HOSTS="localhost:13632/72"
-
 
 unity_build_opt=""
 if [[ "$unity_build" == "true" ]]; then
@@ -115,7 +137,7 @@ mkdir -p "$build_dir"
     --build-triton \
     --build "$build_dir" \
     --fast-build \
-    --enable-distcc \
+    $enable_distcc_opt \
     $unity_build_opt \
     $clean_build_opt \
     "${apply_patches_args[@]}" \
