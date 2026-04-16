@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -u
 
+# 加载状态机模块
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f "$SCRIPT_DIR/state_machine.sh" ]]; then
+    # shellcheck disable=SC1090
+    source "$SCRIPT_DIR/state_machine.sh"
+else
+    echo "Error: state_machine.sh not found in $SCRIPT_DIR" >&2
+    exit 125
+fi
+
 base_dir="${SCHEDULER_BASE_DIR:?SCHEDULER_BASE_DIR is not set}"
 log_dir="${SCHEDULER_LOG_DIR:?SCHEDULER_LOG_DIR is not set}"
 state_file="${SCHEDULER_STATE_FILE:?SCHEDULER_STATE_FILE is not set}"
@@ -17,6 +27,23 @@ artifact_check_script="${SCHEDULER_ARTIFACT_CHECK_SCRIPT:?SCHEDULER_ARTIFACT_CHE
 verify_script="${SCHEDULER_VERIFY_SCRIPT:-$script_dir/user_scripts/verify_latest_build.sh}"
 
 mkdir -p "$log_dir"
+
+# 日志记录函数
+log_info() {
+    local message="$1"
+    local timestamp
+    timestamp="$(date '+%F %T')"
+    echo "[$timestamp] $message" | tee -a "$summary_log"
+}
+
+log_state() {
+    local commit="$1"
+    local state="$2"
+    local reason="${3:-}"
+    local message="[state] $commit: $state"
+    [[ -n "$reason" ]] && message+=" ($reason)"
+    log_info "$message"
+}
 
 reverse_exit=0
 while [[ $# -gt 0 ]]; do
@@ -87,20 +114,7 @@ trap 'finalize_exit' EXIT
 # shellcheck disable=SC1090
 source "$util_script"
 
-STATE_FINAL_GOOD="good"
-STATE_FINAL_SKIP="skip"
-STATE_BUILD_NOT_STARTED="not_started"
-STATE_BUILD_BUILDING="building"
-STATE_BUILD_FAILED="failed"
-STATE_BUILD_SUCCEEDED="succeeded"
-STATE_BUILD_TIMEOUT="timeout"
-STATE_BUILD_INTERRUPTED="interrupted"
-STATE_BUILD_TYPE_INCREMENTAL="incremental"
-STATE_BUILD_TYPE_CLEAN="clean"
-STATE_ARTIFACT_CHECK_ERROR="artifact_check_error"
-STATE_ARTIFACT_INVALID="artifact_invalid"
-STATE_REASON_BUILD_REACH_MAX_TRIES="build_reach_max_tries"
-STATE_REASON_STALE_BUILDING_STATE="stale_building_state"
+# 状态定义已从state_machine.sh导入
 
 current_commit="$(git -C "$base_dir" rev-parse HEAD 2>/dev/null)" || exit 125
 current_commit_short="$(git -C "$base_dir" rev-parse --short HEAD 2>/dev/null)" || exit 125
@@ -164,37 +178,21 @@ case "$final_status" in
     ;;
 esac
 
-echo "========================================"
-echo "Scheduler run #: $total_count"
-echo "Current commit: $current_commit_short ($current_commit)"
-echo "Revision relative to newer commit: $head_desc"
-echo "Commit time: $commit_time"
-echo "Author time: $author_time"
-echo "Start time: $start_human"
-echo "Log file: $log_file"
-echo "Artifact dir: $artifact_dir"
-echo "Build dir: $build_dir"
-echo "Artifact check script: $artifact_check_script"
-echo "Build step script: $build_step_script"
-echo "Verify script: $verify_script"
-echo "========================================"
-
-{
-  echo "========================================"
-  echo "Scheduler run #: $total_count"
-  echo "Current commit: $current_commit_short ($current_commit)"
-  echo "Revision relative to newer commit: $head_desc"
-  echo "Commit time: $commit_time"
-  echo "Author time: $author_time"
-  echo "Start time: $start_human"
-  echo "Log file: $log_file"
-  echo "Artifact dir: $artifact_dir"
-  echo "Build dir: $build_dir"
-  echo "Artifact check script: $artifact_check_script"
-  echo "Build step script: $build_step_script"
-  echo "Verify script: $verify_script"
-  echo "========================================"
-} >> "$summary_log"
+# 输出运行头信息
+log_info "========================================"
+log_info "Scheduler run #: $total_count"
+log_info "Current commit: $current_commit_short ($current_commit)"
+log_info "Revision relative to newer commit: $head_desc"
+log_info "Commit time: $commit_time"
+log_info "Author time: $author_time"
+log_info "Start time: $start_human"
+log_info "Log file: $log_file"
+log_info "Artifact dir: $artifact_dir"
+log_info "Build dir: $build_dir"
+log_info "Artifact check script: $artifact_check_script"
+log_info "Build step script: $build_step_script"
+log_info "Verify script: $verify_script"
+log_info "========================================"
 
 
 set +e
@@ -333,187 +331,9 @@ run_build_once() {
   return "$build_status"
 }
 
-STATE_PREV_BUILD_STATE="$STATE_BUILD_NOT_STARTED"
-STATE_PREV_BUILD_FAILURE_REASON="none"
-STATE_PREV_ARTIFACT_FAILURE_REASON="none"
-STATE_PREV_BUILD_ATTEMPT_COUNT=0
-STATE_PREV_BUILD_TYPE="$STATE_BUILD_TYPE_INCREMENTAL"
+# 状态变量已移至状态机模块
 
-load_build_state_snapshot() {
-  local commit="$1"
-  local raw_attempt_count
-
-  STATE_PREV_BUILD_STATE="$(scheduler_get_status_field "$commit" BUILD_STATE || true)"
-  STATE_PREV_BUILD_FAILURE_REASON="$(scheduler_get_status_field "$commit" BUILD_FAILURE_REASON || true)"
-  STATE_PREV_ARTIFACT_FAILURE_REASON="$(scheduler_get_status_field "$commit" ARTIFACT_FAILURE_REASON || true)"
-  raw_attempt_count="$(scheduler_get_status_field "$commit" BUILD_ATTEMPT_COUNT || true)"
-  STATE_PREV_BUILD_TYPE="$(scheduler_get_status_field "$commit" BUILD_TYPE || true)"
-
-  [[ -z "$STATE_PREV_BUILD_STATE" ]] && STATE_PREV_BUILD_STATE="$STATE_BUILD_NOT_STARTED"
-  [[ -z "$STATE_PREV_BUILD_FAILURE_REASON" ]] && STATE_PREV_BUILD_FAILURE_REASON="none"
-  [[ -z "$STATE_PREV_ARTIFACT_FAILURE_REASON" ]] && STATE_PREV_ARTIFACT_FAILURE_REASON="none"
-  [[ -z "$STATE_PREV_BUILD_TYPE" ]] && STATE_PREV_BUILD_TYPE="$STATE_BUILD_TYPE_INCREMENTAL"
-
-  if [[ "$raw_attempt_count" =~ ^[0-9]+$ ]]; then
-    STATE_PREV_BUILD_ATTEMPT_COUNT="$raw_attempt_count"
-  else
-    STATE_PREV_BUILD_ATTEMPT_COUNT=0
-  fi
-}
-
-# 统一管理构建重试策略，避免主流程里出现过多嵌套 if。
-# 输出格式（按行）：
-#   1) build_type               => incremental | clean
-#   2) start_new_build          => true | false
-#   3) continuing_previous      => true | false
-#   4) fallback_reason          => 文本原因
-#   5) stop_build_loop          => true | false（是否达到最大重试次数）
-determine_build_plan() {
-  local max_try="$1"
-  local build_dir_path="$2"
-  local build_attempt_count="$3"
-  local always_clean_build="$4"
-
-  local build_type="$STATE_BUILD_TYPE_INCREMENTAL"
-  local start_new_build="true"
-  local continuing_previous_build="false"
-  local fallback_reason="none"
-  local stop_build_loop="false"
-  local need_clean_build=0
-
-  if (( build_attempt_count >= max_try )); then
-    echo "$STATE_BUILD_TYPE_INCREMENTAL"
-    echo "true"
-    echo "false"
-    echo "$STATE_REASON_BUILD_REACH_MAX_TRIES"
-    echo "true"
-    return 0
-  fi
-
-  if [[ "$STATE_PREV_BUILD_STATE" == "$STATE_BUILD_NOT_STARTED" || "$always_clean_build" == "true" ]]; then
-    build_type="$STATE_BUILD_TYPE_CLEAN"
-    echo "$build_type"
-    echo "$start_new_build"
-    echo "$continuing_previous_build"
-    echo "$fallback_reason"
-    echo "$stop_build_loop"
-    return 0
-  fi
-
-  # build_dir 不存在/为空，或者第一次构建，必须 clean build。
-  if [[ ! -d "$build_dir_path" ]] || [[ -z "$(ls -A "$build_dir_path" 2>/dev/null)" || ((build_attempt_count == 0)) ]]; then
-    need_clean_build=1
-  fi
-
-  # 用统一状态机处理真实场景下的恢复逻辑。
-  # 注意：building 状态常见于上次任务被中断，此时无法“接着跑同一 pid”，
-  # 因而应恢复为新的构建 attempt，而不是无穷续跑。
-  case "$STATE_PREV_BUILD_STATE" in
-    "$STATE_BUILD_BUILDING")
-      start_new_build="true"
-      continuing_previous_build="false"
-      fallback_reason="$STATE_REASON_STALE_BUILDING_STATE"
-      if [[ "$need_clean_build" -eq 1 ]]; then
-        build_type="$STATE_BUILD_TYPE_CLEAN"
-      else
-        build_type="$STATE_BUILD_TYPE_INCREMENTAL"
-      fi
-      ;;
-    "$STATE_BUILD_FAILED")
-      if [[ "$STATE_PREV_BUILD_TYPE" == "$STATE_BUILD_TYPE_INCREMENTAL" ]]; then
-        build_type="$STATE_BUILD_TYPE_CLEAN"
-        fallback_reason="incremental_build_failed"
-      fi
-      ;;
-    "$STATE_BUILD_SUCCEEDED")
-      if [[ "$STATE_PREV_ARTIFACT_FAILURE_REASON" == "$STATE_ARTIFACT_CHECK_ERROR" ||
-            "$STATE_PREV_ARTIFACT_FAILURE_REASON" == "$STATE_ARTIFACT_INVALID" ]]; then
-        build_type="$STATE_BUILD_TYPE_CLEAN"
-        fallback_reason="${STATE_PREV_ARTIFACT_FAILURE_REASON}"
-      fi
-      ;;
-    "$STATE_BUILD_TIMEOUT"|"$STATE_BUILD_INTERRUPTED")
-      build_type="$STATE_BUILD_TYPE_INCREMENTAL"
-      if [[ "$STATE_PREV_BUILD_FAILURE_REASON" == *_continued ]]; then
-        start_new_build="true"
-        continuing_previous_build="false"
-        fallback_reason="${STATE_PREV_BUILD_TYPE}_build_${STATE_PREV_BUILD_STATE}_retry_new_attempt"
-      else
-        start_new_build="false"
-        continuing_previous_build="true"
-        fallback_reason="${STATE_PREV_BUILD_TYPE}_build_${STATE_PREV_BUILD_STATE}_continue_previous_attempt"
-      fi
-      ;;
-    *)
-      if [[ "$need_clean_build" -eq 1 ]]; then
-        build_type="$STATE_BUILD_TYPE_CLEAN"
-        fallback_reason="build_dir_is_empty_or_not_exist"
-      fi
-      ;;
-  esac
-
-  echo "$build_type"
-  echo "$start_new_build"
-  echo "$continuing_previous_build"
-  echo "$fallback_reason"
-  echo "$stop_build_loop"
-}
-
-# 处理一次构建后的状态落盘。
-# 返回值语义：
-#   0 => 可结束当前 commit 的构建流程（成功或 clean 失败已定论）
-#   1 => 需要继续下一轮重试
-handle_build_outcome() {
-  local commit="$1"
-  local build_type="$2"
-  local continuing_previous_build="$3"
-  local build_status="$4"
-  local artifact_check_status="$5"
-
-  local failure_reason
-
-  if [[ "$build_status" -eq 0 ]]; then
-    scheduler_mark_build_succeeded "$commit"
-    if [[ "$artifact_check_status" -eq 0 ]]; then
-      scheduler_mark_artifact_ready "$commit" "$artifact_dir" "build"
-      return 0
-    fi
-
-    if [[ "$artifact_check_status" -eq 125 ]]; then
-      if [[ "$build_type" == "clean" ]]; then
-        scheduler_mark_artifact_failed "$commit" "artifact_check_error"
-        return 0
-      fi
-      scheduler_mark_artifact_failure_reason "$commit" "artifact_check_error"
-      return 1
-    fi
-
-    if [[ "$build_type" == "clean" ]]; then
-      scheduler_mark_artifact_failed "$commit" "artifact_invalid"
-      return 0
-    fi
-    scheduler_mark_artifact_failure_reason "$commit" "artifact_invalid"
-    return 1
-  fi
-
-  if [[ "$build_status" -eq 124 ]]; then
-    failure_reason="${build_type}_build_timeout"
-    [[ "$continuing_previous_build" == "true" ]] && failure_reason="${failure_reason}_continued"
-    echo "$failure_reason"
-    scheduler_mark_build_timeout "$commit" "$failure_reason"
-  elif [[ "$build_status" -eq 130 || "$build_status" -eq 143 ]]; then
-    failure_reason="${build_type}_build_interrupted"
-    [[ "$continuing_previous_build" == "true" ]] && failure_reason="${failure_reason}_continued"
-    echo "$failure_reason"
-    scheduler_mark_build_interrupted "$commit" "$failure_reason"
-  else
-    failure_reason="${build_type}_build_failed"
-    echo "$failure_reason"
-    scheduler_mark_build_failed "$commit" "$failure_reason"
-  fi
-
-  return 1
-}
+# 状态管理函数已移至state_machine.sh模块
 
 artifact_check_status=1
 build_status=0
@@ -539,17 +359,20 @@ else
 
   final_attempt="none"
   always_clean_build="false"
-  # 构建循环：读取上一次状态 -> 决策本次策略 -> 执行构建 -> 按结果落盘。
+  # 构建循环：使用状态机管理状态 -> 决策本次策略 -> 执行构建 -> 按结果落盘。
   while true; do
-    load_build_state_snapshot "$current_commit"
-    build_attempt_count="$STATE_PREV_BUILD_ATTEMPT_COUNT"
+    # 使用状态机获取构建状态快照
+    eval $(get_build_state_snapshot "$current_commit")
 
     mapfile -t plan < <(
       determine_build_plan \
         "$max_try_times" \
         "$build_dir" \
-        "$build_attempt_count" \
-        "$always_clean_build"
+        "$BUILD_ATTEMPT_COUNT" \
+        "$always_clean_build" \
+        "$BUILD_STATE" \
+        "$ARTIFACT_FAILURE_REASON" \
+        "$BUILD_TYPE"
     )
     build_type="${plan[0]}"
     start_new_build="${plan[1]}"
@@ -558,18 +381,18 @@ else
     stop_build_loop="${plan[4]}"
 
     if [[ "$stop_build_loop" == "true" ]]; then
-      echo "reach max tries:$build_attempt_count>=$max_try_times"
+      echo "reach max tries:$BUILD_ATTEMPT_COUNT>=$max_try_times"
       scheduler_mark_build_final_failed "$current_commit" "$STATE_REASON_BUILD_REACH_MAX_TRIES"
       build_status=111
       break
     fi
-    echo "build_attempt_count:$build_attempt_count (can try)"
+    echo "build_attempt_count:$BUILD_ATTEMPT_COUNT (can try)"
     echo "BUILD_FALLBACK_REASON: $BUILD_FALLBACK_REASON"
     echo "START_NEW_BUILD: $start_new_build"
     final_attempt="$build_type"
     scheduler_mark_build_attempt_start "$current_commit" "$build_type" "$start_new_build"
     scheduler_mark_building "$current_commit" "$build_type"
-    
+
     run_build_once "$build_type"
     build_status=$?
 
@@ -580,18 +403,20 @@ else
       artifact_check_status=1
     fi
 
+    # 使用状态机处理构建结果
     if handle_build_outcome \
       "$current_commit" \
       "$build_type" \
       "$continuing_previous_build" \
       "$build_status" \
-      "$artifact_check_status"; then
+      "$artifact_check_status" \
+      "$artifact_dir"; then
       break
     fi
 
     #防止未知错误导致一直快速循环，卡死，无法使用ctrl+c结束
     sleep 1
-    
+
   done
 
 fi
@@ -628,50 +453,31 @@ total_count=$total_count
 total_elapsed=$total_elapsed
 EOF
 
-echo "----------------------------------------"
-echo "Scheduler run #: $total_count"
-echo "Current commit: $current_commit_short ($current_commit)"
-echo "Final attempt: $final_attempt"
-echo "End time: $end_human"
-echo "Build elapsed: ${build_elapsed}s"
-echo "Verify elapsed: ${verify_elapsed}s"
-echo "Artifact check exit code: $artifact_check_status"
+# 输出运行结果信息
+log_info "----------------------------------------"
+log_info "Scheduler run #: $total_count"
+log_info "Current commit: $current_commit_short ($current_commit)"
+log_info "Final attempt: $final_attempt"
+log_info "End time: $end_human"
+log_info "Build elapsed: ${build_elapsed}s"
+log_info "Verify elapsed: ${verify_elapsed}s"
+log_info "Artifact check exit code: $artifact_check_status"
 if [[ "$did_build" -eq 1 ]]; then
-  echo "Build exit code: $build_status"
+  log_info "Build exit code: $build_status"
 fi
 if [[ "$artifact_check_status" -eq 0 ]]; then
-  echo "Verify exit code: $verify_status"
+  log_info "Verify exit code: $verify_status"
 fi
-echo "Elapsed this run: ${elapsed}s"
-echo "Accumulated elapsed: ${total_elapsed}s"
-
-{
-  echo "End time: $end_human"
-  echo "Final attempt: $final_attempt"
-  echo "Build elapsed: ${build_elapsed}s"
-  echo "Verify elapsed: ${verify_elapsed}s"
-  echo "Artifact check exit code: $artifact_check_status"
-  if [[ "$did_build" -eq 1 ]]; then
-    echo "Build exit code: $build_status"
-  fi
-  if [[ "$artifact_check_status" -eq 0 ]]; then
-    echo "Verify exit code: $verify_status"
-  fi
-  echo "Elapsed this run: ${elapsed}s"
-  echo "Accumulated elapsed: ${total_elapsed}s"
-} >> "$summary_log"
+log_info "Elapsed this run: ${elapsed}s"
+log_info "Accumulated elapsed: ${total_elapsed}s"
 
 if [[ "$artifact_check_status" -eq 0 && "$verify_status" -eq 0 ]]; then
   scheduler_mark_testing_ready "$current_commit"
   scheduler_mark_good "$current_commit"
 
-  echo "Result: GOOD"
-  echo "----------------------------------------"
-  {
-    echo "Result: GOOD"
-    echo "----------------------------------------"
-    echo
-  } >> "$summary_log"
+  log_info "Result: GOOD"
+  log_info "----------------------------------------"
+  echo >> "$summary_log"
   exit 0
 fi
 
@@ -688,24 +494,18 @@ if [[ "$artifact_check_status" -ne 0 ]]; then
     fi
     scheduler_mark_artifact_failed "$current_commit" "$artifact_failure_reason"
   fi
-  echo "Result: BAD (artifact unavailable or invalid)"
+  log_info "Result: BAD (artifact unavailable or invalid)"
   echo "Last 50 lines of log:"
   tail -n 50 "$log_file"
-  {
-    echo "Result: BAD (artifact unavailable or invalid)"
-    echo "----------------------------------------"
-    echo
-  } >> "$summary_log"
+  log_info "----------------------------------------"
+  echo >> "$summary_log"
   exit 1
 fi
 
 scheduler_mark_test_failed "$current_commit"
-echo "Result: BAD (verify failed)"
+log_info "Result: BAD (verify failed)"
 echo "Last 50 lines of log:"
 tail -n 50 "$log_file"
-{
-  echo "Result: BAD (verify failed)"
-  echo "----------------------------------------"
-  echo
-} >> "$summary_log"
+log_info "----------------------------------------"
+echo >> "$summary_log"
 exit 1
