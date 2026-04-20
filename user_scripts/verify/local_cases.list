@@ -1,0 +1,5 @@
+# One local verifier command per line.
+# Empty lines and lines starting with # are ignored.
+#
+# Example (single-line command):
+# bishengir-compile '/home/chenshihuan/ttadapter/forward_kernel_new.ttadapter' --target=Ascend950PR_957c --enable-auto-multi-buffer=False --enable-auto-bind-sub-block=True --disable-ffts --enable-mixed-cv=True --enable-hfusion-compile=true --enable-triton-kernel-compile=true --append-bisheng-options="-cce-link-aicore-ll-module /home/chenshihuan/libdevice.10.bc" --enable-vf-merge-level=1 --mlir-disable-threading 2>&1 | tee /home/chenshihuan/forward_kernel.log

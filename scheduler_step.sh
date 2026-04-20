@@ -168,7 +168,7 @@ case "$final_status" in
     echo "[state] commit already finalized as GOOD, skip rerun"
     exit 0
     ;;
-  bad|artifact_failed|test_failed|timeout)
+  "$STATE_FINAL_BAD"|"$STATE_FINAL_ARTIFACT_FAILED"|"$STATE_FINAL_TEST_FAILED"|"$STATE_FINAL_TIMEOUT")
     echo "[state] commit already finalized as BAD-like status ($final_status), skip rerun"
     exit 1
     ;;
@@ -242,7 +242,7 @@ run_build_once() {
 
   build_start_ts="$(date +%s)"
   build_start_human="$(date '+%F %T')"
-  build_timeout_seconds="${SCHEDULER_BUILD_TIMEOUT_SECONDS:-1000}"
+  build_timeout_seconds="${SCHEDULER_BUILD_TIMEOUT_SECONDS:-2000}"
   timed_out=0
 
   echo "[build] mode: $build_mode"
@@ -379,10 +379,9 @@ else
     continuing_previous_build="${plan[2]}"
     BUILD_FALLBACK_REASON="${plan[3]}"
     stop_build_loop="${plan[4]}"
-
     if [[ "$stop_build_loop" == "true" ]]; then
       echo "reach max tries:$BUILD_ATTEMPT_COUNT>=$max_try_times"
-      scheduler_mark_build_final_failed "$current_commit" "$STATE_REASON_BUILD_REACH_MAX_TRIES"
+      state_machine_transition "$current_commit" "$EVENT_FINAL_ARTIFACT_FAILED" "$STATE_REASON_BUILD_REACH_MAX_TRIES"
       build_status=111
       break
     fi
@@ -391,7 +390,7 @@ else
     echo "START_NEW_BUILD: $start_new_build"
     final_attempt="$build_type"
     scheduler_mark_build_attempt_start "$current_commit" "$build_type" "$start_new_build"
-    scheduler_mark_building "$current_commit" "$build_type"
+    state_machine_transition "$current_commit" "$EVENT_BUILD_START"
 
     run_build_once "$build_type"
     build_status=$?
@@ -416,7 +415,6 @@ else
 
     #防止未知错误导致一直快速循环，卡死，无法使用ctrl+c结束
     sleep 1
-
   done
 
 fi
@@ -473,7 +471,7 @@ log_info "Accumulated elapsed: ${total_elapsed}s"
 
 if [[ "$artifact_check_status" -eq 0 && "$verify_status" -eq 0 ]]; then
   scheduler_mark_testing_ready "$current_commit"
-  scheduler_mark_good "$current_commit"
+  state_machine_transition "$current_commit" "$EVENT_FINAL_GOOD"
 
   log_info "Result: GOOD"
   log_info "----------------------------------------"
@@ -483,7 +481,7 @@ fi
 
 if [[ "$artifact_check_status" -ne 0 ]]; then
   artifact_state="$(scheduler_get_status_field "$current_commit" ARTIFACT_STATE || true)"
-  if [[ "$artifact_state" != "failed" ]]; then
+  if [[ "$artifact_state" != "$STATE_ARTIFACT_FAILED" ]]; then
     artifact_failure_reason="$(scheduler_get_status_field "$current_commit" ARTIFACT_FAILURE_REASON || true)"
     if [[ -z "$artifact_failure_reason" || "$artifact_failure_reason" == "none" ]]; then
       if [[ "$artifact_check_status" -eq 125 ]]; then
@@ -492,7 +490,7 @@ if [[ "$artifact_check_status" -ne 0 ]]; then
         artifact_failure_reason="artifact_invalid"
       fi
     fi
-    scheduler_mark_artifact_failed "$current_commit" "$artifact_failure_reason"
+    state_machine_transition "$current_commit" "$EVENT_FINAL_ARTIFACT_FAILED" "$artifact_failure_reason"
   fi
   log_info "Result: BAD (artifact unavailable or invalid)"
   echo "Last 50 lines of log:"
@@ -502,7 +500,7 @@ if [[ "$artifact_check_status" -ne 0 ]]; then
   exit 1
 fi
 
-scheduler_mark_test_failed "$current_commit"
+state_machine_transition "$current_commit" "$EVENT_FINAL_TEST_FAILED"
 log_info "Result: BAD (verify failed)"
 echo "Last 50 lines of log:"
 tail -n 50 "$log_file"

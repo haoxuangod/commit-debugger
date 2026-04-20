@@ -1,0 +1,8 @@
+# One pytest node per line.
+# Path part should point to local test file path on this machine;
+# launcher will sync that directory to remote shared path and remap the node.
+#
+# Example:
+# /home/c00956950/test_op/test_swizzle2d_new.py::test_swizzle2d[int64-shape7]
+
+/workspace/test_op/test_swizzle2d_new.py::test_swizzle2d[int64-shape7]

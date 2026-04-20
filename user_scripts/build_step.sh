@@ -6,7 +6,7 @@ unity_build="${SCHEDULER_UNITY_BUILD:-true}"
 script_dir="${SCHEDULER_SCRIPT_DIR:?SCHEDULER_SCRIPT_DIR is not set}"
 build_dir="${SCHEDULER_STEP_BUILD_DIR:?SCHEDULER_STEP_BUILD_DIR is not set}"
 artifact_dir="${SCHEDULER_STEP_ARTIFACT_DIR:?SCHEDULER_STEP_ARTIFACT_DIR is not set}"
-current_commit_short="${SCHEDULER_CURRENT_COMMIT_SHORT:?SCHEDULER_CURRENT_COMMIT_COMMIT_SHORT is not set}"
+current_commit_short="${SCHEDULER_CURRENT_COMMIT_SHORT:?SCHEDULER_CURRENT_COMMIT_SHORT is not set}"
 build_mode="${SCHEDULER_BUILD_MODE:-incremental}"
 echo "BASE_DIR:$base_dir"
 
@@ -70,36 +70,42 @@ if [[ "$unity_build" == "true" ]]; then
 fi
 
 workers=(
-  "worker1:13632"
-  "worker2:33632"
+  "worker_182:13632/72"
 )
 
-active_distcc_hosts=()
-for worker_entry in "${workers[@]}"; do
-  worker="${worker_entry%%:*}"
-  local_port="${worker_entry##*:}"
+#active_distcc_hosts=()
+#for worker_entry in "${workers[@]}"; do
+#  worker="${worker_entry%%:*}"
+#  worker_config="${worker_entry#*:}"
+#  local_port="${worker_config%%/*}"
+#  worker_jobs="${worker_config##*/}"
 
-  if lsof -i :"$local_port" > /dev/null 2>&1; then
-    active_distcc_hosts+=("localhost:${local_port}/72")
-    continue
-  fi
+#  if lsof -i :"$local_port" > /dev/null 2>&1; then
+#    active_distcc_hosts+=("localhost:${local_port}/${worker_jobs}")
+#    continue
+#  fi
 
-  if ssh -o BatchMode=yes -o ConnectTimeout=3 "$worker" "echo ok" > /dev/null 2>&1; then
-    ssh -fN -L "${local_port}:127.0.0.1:3632" "$worker"
-    active_distcc_hosts+=("localhost:${local_port}/72")
-  fi
-done
+#  if ssh -o BatchMode=yes -o ConnectTimeout=10 "$worker" "echo ok" > /dev/null 2>&1; then
+#    ssh -fN -L "${local_port}:127.0.0.1:3632" "$worker"
+#    active_distcc_hosts+=("127.0.0.1:${local_port}/${worker_jobs}")
+#  fi
+#done
 
+#enable_distcc_opt=""
+#if (( ${#active_distcc_hosts[@]} > 0 )); then
+#  DISTCC_HOSTS="${active_distcc_hosts[*]}"
+#  export DISTCC_HOSTS
+#  enable_distcc_opt="--enable-distcc"
+#  echo "DISTCC enabled with hosts: $DISTCC_HOSTS"
+#else
+#  echo "No reachable distcc workers, build without distcc"
+#fi
+
+
+#export DISTCC_HOSTS="47.93.126.217:13632"
+#DISTCC_HOSTS='47.93.126.217:13632' distcc clang++ -c test.cpp -o test.o
+#enable_distcc_opt="--enable-distcc"
 enable_distcc_opt=""
-if (( ${#active_distcc_hosts[@]} > 0 )); then
-  DISTCC_HOSTS="${active_distcc_hosts[*]}"
-  export DISTCC_HOSTS
-  enable_distcc_opt="--enable-distcc"
-  echo "DISTCC enabled with hosts: $DISTCC_HOSTS"
-else
-  echo "No reachable distcc workers, build without distcc"
-fi
-
 unity_build_opt=""
 if [[ "$unity_build" == "true" ]]; then
   unity_build_opt="--unity-build"
@@ -117,15 +123,19 @@ mkdir -p "$build_dir"
   apply_patches_args=()
 
   if [[ -f "$PATCH_MARK_FILE" ]]; then
-    echo "patch mark found, run clean-up and enable --apply-patches"
-    "$base_dir/build-tools/apply_patches.sh" --clean-up || exit 1
-    apply_patches_args+=(--apply-patches)
+    echo "patch mark found, patches already applied, skip --apply-patches"
   else
-    echo "patch mark not found, skip clean-up and --apply-patches"
+    echo "patch mark not found, apply patches and create mark"
+    "$base_dir/build-tools/apply_patches.sh" || exit 1
+    apply_patches_args+=(--apply-patches)
+    # 创建补丁标记文件
+    touch "$PATCH_MARK_FILE"
+    echo "Created patch mark file: $PATCH_MARK_FILE"
   fi
 
   chmod +x "$base_dir/build-tools/build1.sh"
   #--disable-ccache
+  #-j 需要与远程与自身核数量进行匹配
   "$base_dir/build-tools/build1.sh" \
     --c-compiler clang \
     --cxx-compiler clang++ \
@@ -141,10 +151,9 @@ mkdir -p "$build_dir"
     $unity_build_opt \
     $clean_build_opt \
     "${apply_patches_args[@]}" \
-    -j 72
+    -j 18
 )
 
 mkdir -p "$artifact_dir" &&
 cp "$build_dir/bin/bishengir-compile" "$artifact_dir"
-
 

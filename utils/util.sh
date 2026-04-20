@@ -232,19 +232,6 @@ scheduler_set_status_fields() {
     "UPDATED_AT=$updated_at"
 }
 
-scheduler_print_commit_status() {
-  local commit="$1"
-  local status_file
-  status_file="$(scheduler_commit_status_file "$commit")"
-
-  if [[ ! -f "$status_file" ]]; then
-    echo "No status file for commit: $commit" >&2
-    return 1
-  fi
-
-  cat "$status_file"
-}
-
 scheduler_prepare_commit_dirs() {
   local commit="$1"
   mkdir -p \
@@ -281,40 +268,6 @@ scheduler_mark_running() {
     "STATE=running"
 }
 
-scheduler_mark_building() {
-  local commit="$1"
-  local build_type="$2"
-  scheduler_set_status_fields "$commit" \
-    "STATE=running" \
-    "ARTIFACT_STATE=acquiring" \
-    "ARTIFACT_SOURCE=build" \
-    "ARTIFACT_FAILURE_REASON=none" \
-    "BUILD_TYPE=$build_type" \
-    "BUILD_STATE=building" \
-    "BUILD_FAILURE_REASON=none" \
-    "FINAL_STATUS=pending"
-}
-scheduler_mark_build_succeeded() {
-    local commit="$1"
-    scheduler_set_status_fields "$commit" \
-    "ARTIFACT_FAILURE_REASON=none" \
-    "BUILD_STATE=succeeded" \
-    "BUILD_FAILURE_REASON=none"
-}
-
-scheduler_mark_downloading() {
-  local commit="$1"
-  scheduler_set_status_fields "$commit" \
-    "STATE=running" \
-    "ARTIFACT_STATE=acquiring" \
-    "ARTIFACT_SOURCE=download" \
-    "ARTIFACT_FAILURE_REASON=none" \
-    "BUILD_STATE=not_started" \
-    "BUILD_FAILURE_REASON=none" \
-    "FINAL_STATUS=pending"
-}
-
-
 scheduler_mark_artifact_ready() {
   local commit="$1"
   local artifact_path="$2"
@@ -328,43 +281,6 @@ scheduler_mark_artifact_ready() {
     "ARTIFACT_PATH=$artifact_path"
 
   scheduler_write_artifact_meta "$commit" "$artifact_path" "$artifact_source"
-}
-
-scheduler_mark_artifact_failed() {
-  local commit="$1"
-  local reason="$2"
-
-  scheduler_set_status_fields "$commit" \
-    "STATE=finished" \
-    "ARTIFACT_STATE=failed" \
-    "ARTIFACT_FAILURE_REASON=$reason" \
-    "FINAL_STATUS=artifact_failed"
-}
-
-scheduler_mark_artifact_failure_reason() {
-  local commit="$1"
-  local reason="$2"
-
-  scheduler_set_status_fields "$commit" \
-    "ARTIFACT_FAILURE_REASON=$reason"
-}
-
-scheduler_mark_build_timeout() {
-  local commit="$1"
-  local reason="$2"
-
-  scheduler_set_status_fields "$commit" \
-    "BUILD_STATE=timeout" \
-    "BUILD_FAILURE_REASON=$reason"
-}
-
-scheduler_mark_build_interrupted() {
-  local commit="$1"
-  local reason="$2"
-
-  scheduler_set_status_fields "$commit" \
-    "BUILD_STATE=interrupted" \
-    "BUILD_FAILURE_REASON=$reason"
 }
 
 scheduler_mark_build_attempt_start() {
@@ -394,86 +310,9 @@ scheduler_mark_build_attempt_start() {
     "ARTIFACT_FAILURE_REASON=none"
 }
 
-scheduler_mark_build_final_failed() {
-  local commit="$1"
-  local reason="$2"
-
-  scheduler_set_status_fields "$commit" \
-    "STATE=finished" \
-    "ARTIFACT_STATE=failed" \
-    "ARTIFACT_SOURCE=build" \
-    "ARTIFACT_FAILURE_REASON=$reason" \
-    "BUILD_FAILURE_REASON=$reason" \
-    "BUILD_STATE=failed" \
-    "FINAL_STATUS=artifact_failed"
-}
-
-scheduler_mark_build_failed() {
-  local commit="$1"
-  local reason="$2"
-
-  scheduler_set_status_fields "$commit" \
-    "BUILD_STATE=failed" \
-    "BUILD_FAILURE_REASON=$reason"
-}
-
 scheduler_mark_testing_ready() {
   local commit="$1"
   scheduler_set_status_fields "$commit" \
     "STATE=running"
 }
 
-scheduler_mark_good() {
-  local commit="$1"
-  scheduler_set_status_fields "$commit" \
-    "STATE=finished" \
-    "FINAL_STATUS=good"
-}
-
-scheduler_mark_bad() {
-  local commit="$1"
-  scheduler_set_status_fields "$commit" \
-    "STATE=finished" \
-    "FINAL_STATUS=bad"
-}
-
-scheduler_mark_skip() {
-  local commit="$1"
-  scheduler_set_status_fields "$commit" \
-    "STATE=finished" \
-    "FINAL_STATUS=skip"
-}
-
-scheduler_mark_test_failed() {
-  local commit="$1"
-  scheduler_set_status_fields "$commit" \
-    "STATE=finished" \
-    "FINAL_STATUS=test_failed"
-}
-
-scheduler_is_commit_finished() {
-  local commit="$1"
-  local final_status
-  final_status="$(scheduler_get_status_field "$commit" FINAL_STATUS || true)"
-
-  case "$final_status" in
-    good|bad|skip|artifact_failed|test_failed|timeout)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
-scheduler_is_artifact_ready() {
-  local commit="$1"
-  local artifact_state
-  artifact_state="$(scheduler_get_status_field "$commit" ARTIFACT_STATE || true)"
-  [[ "$artifact_state" == "ready" ]]
-}
-
-scheduler_commit_artifact_path() {
-  local commit="$1"
-  scheduler_get_status_field "$commit" ARTIFACT_PATH || true
-}
